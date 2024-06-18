@@ -149,59 +149,6 @@ class Plane:
 
 # Acceleration Structures
 
-class BVHNode:
-    def __init__(self, objects):
-        self.left = None
-        self.right = None
-        self.box = None
-
-        if len(objects) == 1:
-            self.left = self.right = objects[0]
-            self.box = objects[0].bounding_box()
-        elif len(objects) == 2:
-            self.left, self.right = sorted(objects, key=lambda x: x.bounding_box().min()[0])
-            self.box = self.bounding_box_union(self.left.bounding_box(), self.right.bounding_box())
-        else:
-            objects.sort(key=lambda x: x.bounding_box().min()[0])
-            mid = len(objects) // 2
-            self.left = BVHNode(objects[:mid])
-            self.right = BVHNode(objects[mid:])
-            self.box = self.bounding_box_union(self.left.box, self.right.box)
-    
-    def bounding_box_union(self, box1, box2):
-        small = np.minimum(box1.min(), box2.min())
-        large = np.maximum(box1.max(), box2.max())
-        return AABB(small, large)
-
-    def intersect(self, ray):
-        if not self.box.hit(ray):
-            return None
-        hit_left = self.left.intersect(ray) if self.left else None
-        hit_right = self.right.intersect(ray) if self.right else None
-        if hit_left and hit_right:
-            return hit_left if hit_left < hit_right else hit_right
-        return hit_left or hit_right
-
-class AABB:
-    def __init__(self, minimum, maximum):
-        self.minimum = np.array(minimum)
-        self.maximum = np.array(maximum)
-    
-    def min(self):
-        return self.minimum
-    
-    def max(self):
-        return self.maximum
-
-    def hit(self, ray):
-        t_min = (self.min() - ray.origin) / ray.direction
-        t_max = (self.max() - ray.origin) / ray.direction
-        t1 = np.minimum(t_min, t_max)
-        t2 = np.maximum(t_min, t_max)
-        t_near = np.maximum(t1[0], np.maximum(t1[1], t1[2]))
-        t_far = np.minimum(t2[0], np.minimum(t2[1], t2[2]))
-        return t_near <= t_far
-
 class NaiveAccelerationStructure:
     def __init__(self, objects):
         self.objects = objects
