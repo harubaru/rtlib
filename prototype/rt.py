@@ -1,6 +1,7 @@
 import tqdm
 import numpy as np
 from multiprocessing import Process, Array
+from PIL import Image
 
 # Constants
 
@@ -13,6 +14,34 @@ class Surface:
         self.w = w
         self.h = h
         self.buffer = Array('d', [0.0, 0.0, 0.0] * w * h)
+    
+    def load(self, filepath: str) -> None:
+        with Image.open(filepath) as img:
+            img = img.convert("RGB")
+            img = img.resize((self.w, self.h))
+            pixels = np.array(img).flatten()
+            pixels = pixels / 256.0
+            for y in range(self.h):
+                for x in range(self.w):
+                    idx = (y * self.w + x) * 3
+                    self.encode_pixel(x, y, *pixels[idx:idx+3])
+
+    def write(self, filepath: str) -> None:
+        img = Image.new("RGB", (self.w, self.h))
+        pixels = [(0, 0, 0)] * self.w * self.h
+
+        for y in range(self.h):
+            for x in range(self.w):
+                r, g, b = self.decode_pixel(x, y)
+                r, g, b = np.sqrt(r), np.sqrt(g), np.sqrt(b)  # Apply gamma correction
+                ir = int(256 * np.clip(r, 0.0, 0.999))
+                ig = int(256 * np.clip(g, 0.0, 0.999))
+                ib = int(256 * np.clip(b, 0.0, 0.999))
+
+                pixels[y * self.w + x] = (ir, ig, ib)
+        
+        img.putdata(pixels)
+        img.save(filepath)
     
     def blit(self, pixels):
         for y in range(self.h):
@@ -30,26 +59,17 @@ class Surface:
         index = (y * self.w + x) * 3
         return [self.buffer[index], self.buffer[index + 1], self.buffer[index + 2]]
     
+    def decode_texel(self, u: float, v: float) -> list:
+        x = int(u * self.w)
+        y = int(v * self.h)
+        return self.decode_pixel(x, y)
+    
     def aspect_ratio(self) -> float:
         return self.w/self.h
 
-def write_surface(filepath: str, surface: Surface) -> None:
-    with open(filepath, "w") as f:
-        f.write(f"P3\n{surface.w} {surface.h}\n255\n")
-
-        for y in range(surface.h):
-            for x in range(surface.w):
-                r, g, b = surface.decode_pixel(x, y)
-                r, g, b = np.sqrt(r), np.sqrt(g), np.sqrt(b)  # Apply gamma correction
-                ir = int(256 * np.clip(r, 0.0, 0.999))
-                ig = int(256 * np.clip(g, 0.0, 0.999))
-                ib = int(256 * np.clip(b, 0.0, 0.999))
-
-                f.write(f"{ir} {ig} {ib}\n")
-
 # RT Primitives
 
-class Payload: # TODO: allow this to be user customizable as a schema. also TODO: custom geometry intersect and payload data for geometry properties.
+class Payload:
     def __init__(self):
         self.scattered_ray = None
         self.color = np.array([0.0, 0.0, 0.0])
@@ -59,6 +79,7 @@ class Payload: # TODO: allow this to be user customizable as a schema. also TODO
         self.t = float('inf') # distance to closest hit
         self.depth = 0
         self.hit = False
+        self.uv = np.array([0.0, 0.0])
 
 class Ray:
     def __init__(
@@ -76,7 +97,7 @@ class Camera:
     def __init__(
             self,
             surface,
-            vfov=90.0,
+            vfov=120.0,
             look_from=np.array([0.0, 0.0, 0.0]),
             look_at=np.array([0.0, 0.0, -1]),
             up=np.array([0.0, 1.0, 0.0])
@@ -139,6 +160,11 @@ class Sphere:
                 return root, hit_normal, hit_point, self
         return None, None, None, None
 
+    def uv(self, hit_point):
+        p = (hit_point - self.center) / self.radius
+        u = 0.5 + np.arctan2(p[2], p[0]) / (2 * np.pi)
+        v = 0.5 - np.arcsin(p[1]) / np.pi
+        return u, v
 
 class Plane:
     def __init__(self, point, normal, material):
@@ -154,6 +180,11 @@ class Plane:
                 hit_point = ray.at(t)
                 return t, self.normal, hit_point, self
         return None, None, None, None
+    
+    def uv(self, hit_point):
+        u = (hit_point[0] - self.point[0]) % 1
+        v = (hit_point[2] - self.point[2]) % 1
+        return u, v
 
 # Acceleration Structures
 class NaiveAccelerationStructure:
@@ -169,6 +200,7 @@ class NaiveAccelerationStructure:
                 payload.hit_object = hit_obj
                 payload.hit = True
                 payload.hit_point = hit_point
+                payload.uv = hit_obj.uv(hit_point)
 
 class RayTracingPipelineArgs:
     def __init__(self, max_depth=1, samples_per_pixel=4, jitter_range=0.5, jitter_factor=4.0):
@@ -209,7 +241,7 @@ class RayTracingPipeline:
         payload = Payload()
         self.accel_structure.intersect(ray, payload)
 
-        if payload.hit:
+        if payload.hit and self.any_hit(ray, payload):
             self.closest_hit(ray, payload)
             if payload.scattered_ray is not None:
                 return payload.color * self.trace_ray(payload.scattered_ray, depth - 1) # recurse!
@@ -225,14 +257,20 @@ class Material:
         raise NotImplementedError("Scatter function must be implemented by subclasses")
 
 class Lambertian(Material):
-    def __init__(self, albedo):
+    def __init__(self, albedo, texture=None):
         self.albedo = np.array(albedo)
+        self.texture = texture
 
     def scatter(self, ray, payload):
         payload.normal = payload.normal if np.dot(ray.direction, payload.normal) < 0 else -payload.normal
         scatter_direction = payload.normal + random_in_hemisphere(payload.normal)
         payload.scattered_ray = Ray(payload.hit_point, scatter_direction)
-        payload.color = self.albedo
+
+        if self.texture:
+            u, v = payload.hit_object.uv(payload.hit_point)
+            payload.color = self.texture.decode_texel(u, v)
+        else:
+            payload.color = self.albedo
         return True
 
 def random_in_hemisphere(normal):
@@ -247,15 +285,20 @@ def random_unit_vector():
     return random_in_hemisphere(np.array([0, 1, 0]))
 
 class Metal(Material):
-    def __init__(self, albedo, fuzz):
+    def __init__(self, albedo, fuzz, texture=None):
         self.albedo = np.array(albedo)
         self.fuzz = fuzz if fuzz < 1 else 1
+        self.texture = texture
     
     def scatter(self, ray, payload):
         reflected = reflect(ray.direction / np.linalg.norm(ray.direction), payload.normal)
         scattered = reflected + self.fuzz * random_unit_vector()
         payload.scattered_ray = Ray(payload.hit_point, scattered)
-        payload.color = self.albedo
+        if self.texture:
+            u, v = payload.hit_object.uv(payload.hit_point)
+            payload.color = self.texture.decode_texel(u, v)
+        else:
+            payload.color = self.albedo
         return np.dot(payload.scattered_ray.direction, payload.normal) > 0
 
 class Dielectric(Material):
@@ -267,7 +310,7 @@ class Dielectric(Material):
         refraction_ratio = self.refr_idx if payload.hit else 1.0 / self.refr_idx
 
         unit_direction = ray.direction / np.linalg.norm(ray.direction)
-        cos_theta = np.dot(-unit_direction, payload.normal)
+        cos_theta = min(np.dot(-unit_direction, payload.normal), 1.0)
         sin_theta = np.sqrt(1.0 - cos_theta**2)
 
         cannot_refract = refraction_ratio * sin_theta > 1.0
@@ -296,13 +339,32 @@ def refract(uv, n, etai_over_etat):
 
 
 # testing stuff!!
-surface = Surface(196, 128)
+surface = Surface(int(196*8), int(128*8))
 camera = Camera(surface)
+
+camera.look_from = np.array([0.0, 0.0, 2.0])
+camera.look_at = np.array([0.0, 0.0, -1.0])
+
+indeed = Surface(388, 421)
+indeed.load("indeed.jpg")
+
+# checker board texture
+def checker_texture() -> Surface:
+    tex = Surface(256, 256)
+    for y in range(tex.h):
+        for x in range(tex.w):
+            c = (x // 32) % 2 != (y // 32) % 2
+            tex.encode_pixel(x, y, *([1.0, 1.0, 1.0] if c else [0.0, 0.0, 0.0]))
+    return tex
 
 def ray_gen_function(x, y):
     return camera.ray(x, y)
 
-def any_hit_function(ray, hit):
+def any_hit_function(ray, payload):
+    # russian roulette
+    if payload.depth > 1:
+        if np.random.rand() < 0.5:
+            return False
     return True
 
 def closest_hit_function(ray, payload):
@@ -321,22 +383,28 @@ def miss_function(ray, payload):
 
 pipeline = RayTracingPipeline(
     NaiveAccelerationStructure([
-        Plane([0, -0.5, 0], [0, 1, 0], Lambertian([0.1, 0.4, 0.1])),
-        Sphere([-1, 0, -1], 0.5, Lambertian([0.8, 0.8, 0.0])),
-        Sphere([0, 0, -1], 0.5, Dielectric(1.53)),
+        Plane([0, -0.5, 0], [0, 1, 0], Lambertian([0.1, 0.4, 0.1], indeed)),
+        Sphere([-1, 0, -1], 0.5, Lambertian([0.2, 0.6, 0.8])),
+        Sphere([0, 0, -1], 0.5, Dielectric(2.4)),
         Sphere([1, 0, -1], 0.5, Metal([0.8, 0.6, 0.2], 0.5)),
+        # sphere on top of the first sphere
+        Sphere([-1, 1, -1], 0.5, Metal([1.0, 0.0, 0.0], 0.1, checker_texture())),
+        # sphere on top of the second sphere
+        Sphere([0, 1, -1], 0.5, Lambertian([0.0, 1.0, 0.0], checker_texture())),
+        # sphere on top of the third sphere
+        Sphere([1, 1, -1], 0.5, Metal([0.0, 0.0, 1.0], 0.75, checker_texture()))
     ]),
     ray_gen_function,
     any_hit_function,
     closest_hit_function,
     miss_function,
-    RayTracingPipelineArgs(128, 128, 0.5, 2.0)
+    RayTracingPipelineArgs(4, 8, 0.5, 1.5)
 )
 
 from multiprocessing import Process
 
 if __name__ == '__main__':
-    world_size = 24
+    world_size = 32
     processes = []
 
     for i in range(world_size):
@@ -347,4 +415,4 @@ if __name__ == '__main__':
     for process in processes:
         process.join()
 
-write_surface("output.ppm", surface)
+    surface.write("output.png")
