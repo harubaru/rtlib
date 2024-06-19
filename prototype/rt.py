@@ -1,5 +1,6 @@
 import tqdm
 import numpy as np
+from multiprocessing import Process, Array
 
 # Constants
 
@@ -11,7 +12,7 @@ class Surface:
     def __init__(self, w, h) -> None:
         self.w = w
         self.h = h
-        self.buffer = [[0.0, 0.0, 0.0] for _ in range(w * h)]
+        self.buffer = Array('d', [0.0, 0.0, 0.0] * w * h)
     
     def blit(self, pixels):
         for y in range(self.h):
@@ -20,10 +21,14 @@ class Surface:
                 self.buffer[idx] = pixels[idx]
     
     def encode_pixel(self, x: int, y: int, r: float, g: float, b: float):
-        self.buffer[(y * self.w) + x] = [r, g, b]
+        index = (y * self.w + x) * 3
+        self.buffer[index] = r
+        self.buffer[index + 1] = g
+        self.buffer[index + 2] = b
 
     def decode_pixel(self, x: int, y: int) -> list:
-        return self.buffer[(y * self.w) + x]
+        index = (y * self.w + x) * 3
+        return [self.buffer[index], self.buffer[index + 1], self.buffer[index + 2]]
     
     def aspect_ratio(self) -> float:
         return self.w/self.h
@@ -34,11 +39,11 @@ def write_surface(filepath: str, surface: Surface) -> None:
 
         for y in range(surface.h):
             for x in range(surface.w):
-                r, g, b = np.clip(np.sqrt(np.array(surface.decode_pixel(x, y))), 0.0, 0.999)
-
-                ir = int(256 * r)
-                ig = int(256 * g)
-                ib = int(256 * b)
+                r, g, b = surface.decode_pixel(x, y)
+                r, g, b = np.sqrt(r), np.sqrt(g), np.sqrt(b)  # Apply gamma correction
+                ir = int(256 * np.clip(r, 0.0, 0.999))
+                ig = int(256 * np.clip(g, 0.0, 0.999))
+                ib = int(256 * np.clip(b, 0.0, 0.999))
 
                 f.write(f"{ir} {ig} {ib}\n")
 
@@ -238,6 +243,21 @@ def random_in_hemisphere(normal):
     else:
         return -in_unit_sphere
 
+def random_unit_vector():
+    return random_in_hemisphere(np.array([0, 1, 0]))
+
+class Metal(Material):
+    def __init__(self, albedo, fuzz):
+        self.albedo = np.array(albedo)
+        self.fuzz = fuzz if fuzz < 1 else 1
+    
+    def scatter(self, ray, payload):
+        reflected = reflect(ray.direction / np.linalg.norm(ray.direction), payload.normal)
+        scattered = reflected + self.fuzz * random_unit_vector()
+        payload.scattered_ray = Ray(payload.hit_point, scattered)
+        payload.color = self.albedo
+        return np.dot(payload.scattered_ray.direction, payload.normal) > 0
+
 class Dielectric(Material):
     def __init__(self, refr_idx):
         self.refr_idx = refr_idx
@@ -251,28 +271,28 @@ class Dielectric(Material):
         sin_theta = np.sqrt(1.0 - cos_theta**2)
 
         cannot_refract = refraction_ratio * sin_theta > 1.0
-        if cannot_refract or self.reflectance(cos_theta, refraction_ratio) > np.random.rand():
-            direction = np.array(self.reflect(unit_direction, payload.normal))
+        if cannot_refract or reflectance(cos_theta, refraction_ratio) > np.random.rand():
+            direction = np.array(reflect(unit_direction, payload.normal))
         else:
-            direction = np.array(self.refract(unit_direction, payload.normal, refraction_ratio))
+            direction = np.array(refract(unit_direction, payload.normal, refraction_ratio))
         
         payload.scattered_ray = Ray(payload.hit_point, direction)
         payload.color = attenuation
         return True
     
-    def reflectance(self, cosine, ref_idx):
-        r0 = (1 - ref_idx) / (1 + ref_idx)
-        r0 = r0**2
-        return r0 + (1 - r0) * (1 - cosine)**5
-    
-    def reflect(self, v, n):
-        return v - 2 * np.dot(v, n) * n
+def reflectance(cosine, ref_idx):
+    r0 = (1 - ref_idx) / (1 + ref_idx)
+    r0 = r0**2
+    return r0 + (1 - r0) * (1 - cosine)**5
 
-    def refract(self, uv, n, etai_over_etat):
-        cos_theta = np.dot(-uv, n)
-        r_out_parallel = etai_over_etat * (uv + cos_theta * n)
-        r_out_perp = -np.sqrt(1.0 - (r_out_parallel**2).sum()) * n
-        return r_out_parallel + r_out_perp
+def reflect(v, n):
+    return v - 2 * np.dot(v, n) * n
+
+def refract(uv, n, etai_over_etat):
+    cos_theta = np.dot(-uv, n)
+    r_out_parallel = etai_over_etat * (uv + cos_theta * n)
+    r_out_perp = -np.sqrt(1.0 - (r_out_parallel**2).sum()) * n
+    return r_out_parallel + r_out_perp
 
 
 # testing stuff!!
@@ -301,17 +321,30 @@ def miss_function(ray, payload):
 
 pipeline = RayTracingPipeline(
     NaiveAccelerationStructure([
-        Sphere([0, 0, -1], 0.5, Lambertian([0.8, 0.3, 0.3])),
-        Sphere([1, 0, -1], 0.5, Dielectric(1.5)),
-        Sphere([-1, 0, -1], 0.5, Lambertian([0.3, 0.3, 0.8])),
         Plane([0, -0.5, 0], [0, 1, 0], Lambertian([0.1, 0.4, 0.1])),
+        Sphere([-1, 0, -1], 0.5, Lambertian([0.8, 0.8, 0.0])),
+        Sphere([0, 0, -1], 0.5, Dielectric(1.53)),
+        Sphere([1, 0, -1], 0.5, Metal([0.8, 0.6, 0.2], 0.5)),
     ]),
     ray_gen_function,
     any_hit_function,
     closest_hit_function,
     miss_function,
-    RayTracingPipelineArgs(32, 32, 0.5, 2.0)
+    RayTracingPipelineArgs(128, 128, 0.5, 2.0)
 )
 
-pipeline.dispatch_rays(surface, 1, 0)
+from multiprocessing import Process
+
+if __name__ == '__main__':
+    world_size = 24
+    processes = []
+
+    for i in range(world_size):
+        process = Process(target=pipeline.dispatch_rays, args=(surface, world_size, i))
+        processes.append(process)
+        process.start()
+
+    for process in processes:
+        process.join()
+
 write_surface("output.ppm", surface)
