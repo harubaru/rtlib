@@ -94,7 +94,6 @@ class Ray:
         self.depth = 0
         self.hit = False
         self.uv = np.array([0.0, 0.0])
-        self.light_contrib = np.array([0.0, 0.0, 0.0])
 
     def at(self, t: float):
         return self.origin + t * self.direction
