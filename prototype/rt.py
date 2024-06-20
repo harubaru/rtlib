@@ -213,11 +213,12 @@ class TLAS:
         self.intersect_fn(self.blas_instances, ray, payload)
 
 class RayTracingPipelineArgs:
-    def __init__(self, max_depth=1, samples_per_pixel=4, jitter_range=0.5, jitter_factor=4.0):
+    def __init__(self, max_depth=1, samples_per_pixel=4, jitter_range=0.5, jitter_factor=4.0, num_passes=1):
         self.max_depth = max_depth
         self.samples_per_pixel = samples_per_pixel
         self.jitter_range = jitter_range
         self.jitter_factor = jitter_factor
+        self.num_passes = num_passes
 
 class RayTracingPipeline:
     def __init__(self, accel_structure, lights, ray_gen, any_hit, closest_hit, miss, post_process, args):
@@ -240,10 +241,14 @@ class RayTracingPipeline:
         for y in tqdm.trange(start_row, end_row):
             for x in range(w):
                 color_buffer = np.array([0.0, 0.0, 0.0])
-                for _ in range(self.args.samples_per_pixel):
-                    ray = self.ray_gen(x, y)
-                    color_buffer += self.trace_ray(ray, self.args.max_depth)
-                average_color = color_buffer / self.args.samples_per_pixel
+                for _ in range(self.args.num_passes):
+                    pass_color = np.array([0.0, 0.0, 0.0])
+                    for _ in range(self.args.samples_per_pixel):
+                        ray = self.ray_gen(x, y)
+                        pass_color += self.trace_ray(ray, self.args.max_depth)
+                    pass_color /= self.args.samples_per_pixel
+                    color_buffer += pass_color
+                average_color = color_buffer / self.args.num_passes
                 average_color = self.post_process(x, y, average_color)
                 surface.encode_pixel(x, y, *average_color)
 
@@ -408,9 +413,6 @@ camera = Camera(surface)
 camera.look_from = np.array([0.0, 0.0, 2.0])
 camera.look_at = np.array([0.0, 0.0, -1.0])
 
-indeed = Surface(388, 421)
-indeed.load("indeed.jpg")
-
 # checker board texture
 def checker_texture() -> Surface:
     tex = Surface(256, 256)
@@ -464,16 +466,13 @@ def tlas_intersect_fn(blas_instances, ray, payload):
         blas_instance(ray, payload)
 
 acceleration_structure = TLAS([BLAS([
-    Plane([0, -0.5, 0], [0, 1, 0], Lambertian([0.1, 0.4, 0.1], indeed)),
+    Plane([0, -0.5, 0], [0, 1, 0], Lambertian([0.1, 0.4, 0.1], checker_texture())),
     Sphere([-1, 0, -1], 0.5, Lambertian([0.2, 0.6, 0.8])),
     Sphere([0, 0, -1], 0.5, Dielectric(2.4)),
     Sphere([1, 0, -1], 0.5, Metal([0.8, 0.6, 0.2], 0.5)),
-    # sphere on top of the first sphere
-    Sphere([-1, 1, -1], 0.5, Metal([1.0, 0.0, 0.0], 0.1, checker_texture())),
-    # sphere on top of the second sphere
-    Sphere([0, 1, -1], 0.5, Lambertian([0.0, 1.0, 0.0], checker_texture())),
-    # sphere on top of the third sphere
-    Sphere([1, 1, -1], 0.5, Metal([0.0, 0.0, 1.0], 0.75, checker_texture()))
+    Sphere([-1, 1, -1], 0.5, Metal([1.0, 0.0, 0.0], 0.1)),
+    Sphere([0, 1, -1], 0.5, Lambertian([0.0, 1.0, 0.0])),
+    Sphere([1, 1, -1], 0.5, Metal([0.0, 0.0, 1.0], 0.75))
 ], blas_intersect_fn)], tlas_intersect_fn)
 
 
@@ -491,7 +490,8 @@ pipeline = RayTracingPipeline(
         max_depth=4,
         samples_per_pixel=4,
         jitter_range=0.5,
-        jitter_factor=1.5
+        jitter_factor=1.5,
+        num_passes=16
     ),
 )
 
