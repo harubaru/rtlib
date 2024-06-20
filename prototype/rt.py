@@ -7,7 +7,7 @@ from PIL import Image
 
 EPSILON = 1e-6
 
-# Surface & PPM Code
+# RT Surface
 
 class Surface:
     def __init__(self, w, h) -> None:
@@ -70,16 +70,25 @@ class Surface:
 # RT Primitives
 
 class Payload:
-    def __init__(self):
-        self.scattered_ray = None
-        self.color = np.array([0.0, 0.0, 0.0])
-        self.hit_point = np.array([0.0, 0.0, 0.0])
-        self.normal = np.array([0.0, 0.0, 0.0])
-        self.hit_object = None
-        self.t = float('inf') # distance to closest hit
-        self.depth = 0
-        self.hit = False
-        self.uv = np.array([0.0, 0.0])
+    def __init__(self, **kwargs):
+        self.data = kwargs
+        self.data.setdefault('scattered_ray', None)
+        self.data.setdefault('color', np.array([0.0, 0.0, 0.0]))
+        self.data.setdefault('hit_point', np.array([0.0, 0.0, 0.0]))
+        self.data.setdefault('normal', np.array([0.0, 0.0, 0.0]))
+        self.data.setdefault('hit_object', None)
+        self.data.setdefault('t', float('inf'))  # distance to closest hit
+        self.data.setdefault('depth', 0)
+        self.data.setdefault('hit', False)
+        self.data.setdefault('uv', np.array([0.0, 0.0]))
+        self.data.setdefault('light_contrib', np.array([0.0, 0.0, 0.0]))
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
+
 
 class Ray:
     def __init__(
@@ -187,20 +196,21 @@ class Plane:
         return u, v
 
 # Acceleration Structures
-class NaiveAccelerationStructure:
-    def __init__(self, objects):
+class BLAS:
+    def __init__(self, objects, intersect_fn):
         self.objects = objects
+        self.intersect_fn = intersect_fn
+    
+    def __call__(self, ray, payload):
+        self.intersect_fn(self.objects, ray, payload)
 
-    def intersect(self, ray, payload):
-        for obj in self.objects:
-            t, hit_normal, hit_point, hit_obj = obj.intersect(ray)
-            if t is not None and t < payload.t:
-                payload.t = t
-                payload.normal = hit_normal
-                payload.hit_object = hit_obj
-                payload.hit = True
-                payload.hit_point = hit_point
-                payload.uv = hit_obj.uv(hit_point)
+class TLAS:
+    def __init__(self, blas_instances, intersect_fn):
+        self.blas_instances = blas_instances
+        self.intersect_fn = intersect_fn
+
+    def __call__(self, ray, payload):
+        self.intersect_fn(self.blas_instances, ray, payload)
 
 class RayTracingPipelineArgs:
     def __init__(self, max_depth=1, samples_per_pixel=4, jitter_range=0.5, jitter_factor=4.0):
@@ -210,12 +220,14 @@ class RayTracingPipelineArgs:
         self.jitter_factor = jitter_factor
 
 class RayTracingPipeline:
-    def __init__(self, accel_structure, ray_gen, any_hit, closest_hit, miss, args):
-        self.accel_structure = accel_structure
+    def __init__(self, accel_structure, lights, ray_gen, any_hit, closest_hit, miss, post_process, args):
+        self.accel_structure = accel_structure # our tlas
+        self.lights = lights
         self.ray_gen = ray_gen
         self.any_hit = any_hit
         self.closest_hit = closest_hit
         self.miss = miss
+        self.post_process = post_process
         self.args = args
 
     def dispatch_rays(self, surface, world_size, global_rank):
@@ -232,6 +244,7 @@ class RayTracingPipeline:
                     ray = self.ray_gen(x, y)
                     color_buffer += self.trace_ray(ray, self.args.max_depth)
                 average_color = color_buffer / self.args.samples_per_pixel
+                average_color = self.post_process(x, y, average_color)
                 surface.encode_pixel(x, y, *average_color)
 
     def trace_ray(self, ray, depth):
@@ -239,14 +252,14 @@ class RayTracingPipeline:
             return np.array([0, 0, 0]) # we've gone too deep! bail out!
 
         payload = Payload()
-        self.accel_structure.intersect(ray, payload)
+        self.accel_structure(ray, payload)
 
-        if payload.hit and self.any_hit(ray, payload):
-            self.closest_hit(ray, payload)
-            if payload.scattered_ray is not None:
-                return payload.color * self.trace_ray(payload.scattered_ray, depth - 1) # recurse!
+        if payload['hit'] and self.any_hit(ray, payload):
+            self.closest_hit(ray, payload, self.lights, self.accel_structure)
+            if payload['scattered_ray'] is not None:
+                return payload['color'] * self.trace_ray(payload['scattered_ray'], depth - 1) # recurse!
             else:
-                return payload.color # it's over! return the color!
+                return payload['color'] # it's over! return the color!
         else:
             return self.miss(ray, payload) # noone was hit! return the miss color!
 
@@ -262,15 +275,15 @@ class Lambertian(Material):
         self.texture = texture
 
     def scatter(self, ray, payload):
-        payload.normal = payload.normal if np.dot(ray.direction, payload.normal) < 0 else -payload.normal
-        scatter_direction = payload.normal + random_in_hemisphere(payload.normal)
-        payload.scattered_ray = Ray(payload.hit_point, scatter_direction)
+        payload['normal'] = payload['normal'] if np.dot(ray.direction, payload['normal']) < 0 else -payload['normal']
+        scatter_direction = payload['normal'] + random_in_hemisphere(payload['normal'])
+        payload['scattered_ray'] = Ray(payload['hit_point'], scatter_direction)
 
         if self.texture:
-            u, v = payload.hit_object.uv(payload.hit_point)
-            payload.color = self.texture.decode_texel(u, v)
+            u, v = payload['hit_object'].uv(payload['hit_point'])
+            payload['color'] = self.texture.decode_texel(u, v)
         else:
-            payload.color = self.albedo
+            payload['color'] = self.albedo
         return True
 
 def random_in_hemisphere(normal):
@@ -291,15 +304,16 @@ class Metal(Material):
         self.texture = texture
     
     def scatter(self, ray, payload):
-        reflected = reflect(ray.direction / np.linalg.norm(ray.direction), payload.normal)
+        reflected = reflect(ray.direction / np.linalg.norm(ray.direction), payload['normal'])
         scattered = reflected + self.fuzz * random_unit_vector()
-        payload.scattered_ray = Ray(payload.hit_point, scattered)
+        payload['scattered_ray'] = Ray(payload['hit_point'], scattered)
         if self.texture:
-            u, v = payload.hit_object.uv(payload.hit_point)
-            payload.color = self.texture.decode_texel(u, v)
+            u, v = payload['hit_object'].uv(payload['hit_point'])
+            payload['color'] = self.texture.decode_texel(u, v)
         else:
-            payload.color = self.albedo
-        return np.dot(payload.scattered_ray.direction, payload.normal) > 0
+            payload['color'] = self.albedo
+        return np.dot(payload['scattered_ray'].direction, payload['normal']) > 0
+
 
 class Dielectric(Material):
     def __init__(self, refr_idx):
@@ -307,20 +321,20 @@ class Dielectric(Material):
     
     def scatter(self, ray, payload):
         attenuation = np.array([1.0, 1.0, 1.0])
-        refraction_ratio = self.refr_idx if payload.hit else 1.0 / self.refr_idx
+        refraction_ratio = self.refr_idx if payload['hit'] else 1.0 / self.refr_idx
 
         unit_direction = ray.direction / np.linalg.norm(ray.direction)
-        cos_theta = min(np.dot(-unit_direction, payload.normal), 1.0)
+        cos_theta = min(np.dot(-unit_direction, payload['normal']), 1.0)
         sin_theta = np.sqrt(1.0 - cos_theta**2)
 
         cannot_refract = refraction_ratio * sin_theta > 1.0
         if cannot_refract or reflectance(cos_theta, refraction_ratio) > np.random.rand():
-            direction = np.array(reflect(unit_direction, payload.normal))
+            direction = np.array(reflect(unit_direction, payload['normal']))
         else:
-            direction = np.array(refract(unit_direction, payload.normal, refraction_ratio))
+            direction = np.array(refract(unit_direction, payload['normal'], refraction_ratio))
         
-        payload.scattered_ray = Ray(payload.hit_point, direction)
-        payload.color = attenuation
+        payload['scattered_ray'] = Ray(payload['hit_point'], direction)
+        payload['color'] = attenuation
         return True
     
 def reflectance(cosine, ref_idx):
@@ -337,9 +351,58 @@ def refract(uv, n, etai_over_etat):
     r_out_perp = -np.sqrt(1.0 - (r_out_parallel**2).sum()) * n
     return r_out_parallel + r_out_perp
 
+# RT Lighting
+
+class Light:
+    def calculate_intensity(self, hit_point, normal, accel_structure):
+        raise NotImplementedError
+
+class PointLight(Light):
+    def __init__(self, position, intensity, color):
+        self.position = np.array(position)
+        self.intensity = intensity
+        self.color = np.array(color)
+
+    def calculate_intensity(self, hit_point, normal, accel_structure):
+        direction_to_light = self.position - hit_point
+        distance_to_light = np.linalg.norm(direction_to_light)
+        direction_to_light /= distance_to_light
+
+        shadow_ray = Ray(hit_point + EPSILON * normal, direction_to_light)
+        shadow_payload = Payload()
+        accel_structure(shadow_ray, shadow_payload)
+
+        if shadow_payload['hit'] and shadow_payload['t'] < distance_to_light:
+            return np.zeros(3)  # In shadow
+        else:
+            diffuse_intensity = max(np.dot(normal, direction_to_light), 0.0)
+            return self.intensity * self.color * diffuse_intensity
+
+class DirectionalLight(Light):
+    def __init__(self, direction, intensity, color):
+        self.direction = np.array(direction) / np.linalg.norm(direction)
+        self.intensity = intensity
+        self.color = np.array(color)
+
+    def calculate_intensity(self, hit_point, normal, accel_structure):
+        shadow_ray = Ray(hit_point + EPSILON * normal, -self.direction)
+        shadow_payload = Payload()
+        accel_structure(shadow_ray, shadow_payload)
+
+        if shadow_payload['hit']:
+            return np.zeros(3)  # In shadow
+        else:
+            diffuse_intensity = max(np.dot(normal, -self.direction), 0.0)
+            return self.intensity * self.color * diffuse_intensity
+
+def calculate_lighting(lights, hit_point, normal, accel_structure):
+    color = np.zeros(3)
+    for light in lights:
+        color += light.calculate_intensity(hit_point, normal, accel_structure)
+    return color
 
 # testing stuff!!
-surface = Surface(int(196*8), int(128*8))
+surface = Surface(int(196*4), int(128*4))
 camera = Camera(surface)
 
 camera.look_from = np.array([0.0, 0.0, 2.0])
@@ -362,49 +425,80 @@ def ray_gen_function(x, y):
 
 def any_hit_function(ray, payload):
     # russian roulette
-    if payload.depth > 1:
+    if payload['depth'] > 1:
         if np.random.rand() < 0.5:
             return False
     return True
 
-def closest_hit_function(ray, payload):
-    material = payload.hit_object.material
+def closest_hit_function(ray, payload, lights, accel_structure):
+    material = payload['hit_object'].material
     hit = material.scatter(ray, payload)
     if hit:
-        color = payload.color
+        lighting = calculate_lighting(lights, payload['hit_point'], payload['normal'], accel_structure)
+        color = payload['color'] * lighting
+        payload['color'] = color
     else:
-        color = [0, 0, 0]
-    return color
+        payload['color'] = [0, 0, 0]
+    return payload['color']
 
 def miss_function(ray, payload):
     unit_direction = ray.direction / np.linalg.norm(ray.direction)
     t = 0.5 * (unit_direction[1] + 1.0)
     return (1.0 - t) * np.array([1.0, 1.0, 1.0]) + t * np.array([0.5, 0.7, 1.0])
 
+def post_process(x, y, color):
+    return np.clip(color, 0.0, 1.0)
+
+def blas_intersect_fn(objects, ray, payload):
+    for obj in objects:
+        t, normal, hit_point, hit_object = obj.intersect(ray)
+        if t is not None and t < payload['t']:
+            payload['t'] = t
+            payload['normal'] = normal
+            payload['hit_point'] = hit_point
+            payload['hit_object'] = hit_object
+            payload['hit'] = True
+
+def tlas_intersect_fn(blas_instances, ray, payload):
+    for blas_instance in blas_instances:
+        blas_instance(ray, payload)
+
+acceleration_structure = TLAS([BLAS([
+    Plane([0, -0.5, 0], [0, 1, 0], Lambertian([0.1, 0.4, 0.1], indeed)),
+    Sphere([-1, 0, -1], 0.5, Lambertian([0.2, 0.6, 0.8])),
+    Sphere([0, 0, -1], 0.5, Dielectric(2.4)),
+    Sphere([1, 0, -1], 0.5, Metal([0.8, 0.6, 0.2], 0.5)),
+    # sphere on top of the first sphere
+    Sphere([-1, 1, -1], 0.5, Metal([1.0, 0.0, 0.0], 0.1, checker_texture())),
+    # sphere on top of the second sphere
+    Sphere([0, 1, -1], 0.5, Lambertian([0.0, 1.0, 0.0], checker_texture())),
+    # sphere on top of the third sphere
+    Sphere([1, 1, -1], 0.5, Metal([0.0, 0.0, 1.0], 0.75, checker_texture()))
+], blas_intersect_fn)], tlas_intersect_fn)
+
+
 pipeline = RayTracingPipeline(
-    NaiveAccelerationStructure([
-        Plane([0, -0.5, 0], [0, 1, 0], Lambertian([0.1, 0.4, 0.1], indeed)),
-        Sphere([-1, 0, -1], 0.5, Lambertian([0.2, 0.6, 0.8])),
-        Sphere([0, 0, -1], 0.5, Dielectric(2.4)),
-        Sphere([1, 0, -1], 0.5, Metal([0.8, 0.6, 0.2], 0.5)),
-        # sphere on top of the first sphere
-        Sphere([-1, 1, -1], 0.5, Metal([1.0, 0.0, 0.0], 0.1, checker_texture())),
-        # sphere on top of the second sphere
-        Sphere([0, 1, -1], 0.5, Lambertian([0.0, 1.0, 0.0], checker_texture())),
-        # sphere on top of the third sphere
-        Sphere([1, 1, -1], 0.5, Metal([0.0, 0.0, 1.0], 0.75, checker_texture()))
-    ]),
+    acceleration_structure,
+    [
+        DirectionalLight([1, -1, -1], 1.0, [1.0, 1.0, 1.0]),
+    ],
     ray_gen_function,
     any_hit_function,
     closest_hit_function,
     miss_function,
-    RayTracingPipelineArgs(4, 8, 0.5, 1.5)
+    post_process,
+    RayTracingPipelineArgs(
+        max_depth=4,
+        samples_per_pixel=4,
+        jitter_range=0.5,
+        jitter_factor=1.5
+    ),
 )
 
 from multiprocessing import Process
 
 if __name__ == '__main__':
-    world_size = 32
+    world_size = 24
     processes = []
 
     for i in range(world_size):
