@@ -174,7 +174,7 @@ class Plane:
     
     def intersect(self, ray):
         denom = np.dot(self.normal, ray.direction)
-        if np.abs(denom) > 1e-6:
+        if np.abs(denom) > EPSILON:
             t = np.dot(self.point - ray.origin, self.normal) / denom
             if t >= EPSILON:
                 hit_point = ray.at(t)
